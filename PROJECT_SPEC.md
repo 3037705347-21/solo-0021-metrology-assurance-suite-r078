@@ -28,6 +28,8 @@ external service.
   technician, and timestamp.
 - EvidenceSeal: the immutable closing record for a reviewed case, including the
   selected accepted measurement.
+- CustodyTransfer: one handoff in the evidence custody chain, recording the
+  previous custodian, the receiving custodian, and a reason.
 - AuditEvent: an append-only trace of meaningful case and device changes.
 
 ## Workflows
@@ -63,7 +65,17 @@ service records the actor and reason in the audit trail.
 The verifier sends `POST /cases/{id}/seal` after an accepted measurement. Only
 `review_ready` cases may be sealed. The service selects the accepted
 measurement with the smallest absolute deviation, creates exactly one evidence
-seal, moves the case to `sealed`, and rejects later mutations.
+seal, moves the case to `sealed`, and rejects later mutations. Sealing also
+opens the custody chain: the sealer becomes the first custodian.
+
+### 6. Transfer Custody
+
+A custodian sends `POST /cases/{id}/custody` with the current custodian, the
+receiver, and a reason. The case must be sealed. The transfer is recorded only
+when the sender is the current custodian, and the check and the record commit
+atomically, so concurrent transfers leave exactly one winner. The current
+custodian is always the receiver of the latest recorded transfer.
+`GET /cases/{id}/custody` returns the full chain and the current custodian.
 
 ## State And Rules
 
@@ -88,6 +100,11 @@ Required invariants:
 - A tolerance must be positive.
 - A case can have at most one evidence seal.
 - A sealed case cannot accept measurements, reopen, or seal again.
+- The custody chain starts with the sealer when the case is sealed.
+- A custody transfer is recorded only while its sender is the current
+  custodian; a rejected transfer leaves no record.
+- The current custodian is the receiver of the latest recorded transfer, and
+  recorded transfers are append-only and never rewritten.
 - Every mutation that changes a case also appends an audit event in the same
   repository commit.
 
@@ -112,6 +129,8 @@ Required invariants:
 - `POST /cases/{id}/measurements`
 - `POST /cases/{id}/reopen`
 - `POST /cases/{id}/seal`
+- `GET /cases/{id}/custody`
+- `POST /cases/{id}/custody`
 - `GET /cases/{id}/events`
 
 ## Validation Plan
@@ -121,7 +140,8 @@ bounded production smoke command under `cmd/workflowcheck`. The command starts
 an HTTP test server in the same process, calls the public routes, and verifies
 both success and failure behavior. The seal check also races two concurrent
 seal requests to prove that the repository mutation lock permits exactly one
-seal.
+seal. The custody check likewise races two concurrent transfers to prove that
+exactly one transfer commits and the chain stays single.
 
 Tests are intentionally deferred for this initialization baseline. The later
 engineering-task stage will add unit and integration tests, including red/green

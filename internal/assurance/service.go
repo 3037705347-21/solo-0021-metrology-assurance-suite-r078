@@ -286,7 +286,7 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 			m.NextID("custody"),
 			item.ID,
 			"",
-			item.Steward,
+			seal.Reviewer,
 			"evidence sealed and entered custody",
 			s.now(),
 		)
@@ -320,9 +320,6 @@ func (s *Service) Custody(ctx context.Context, caseID string) (contracts.Custody
 
 func (s *Service) TransferCustody(ctx context.Context, caseID string, input contracts.CustodyTransferRequest) (contracts.CustodyResponse, error) {
 	id := strings.TrimSpace(caseID)
-	from := strings.TrimSpace(input.From)
-	to := strings.TrimSpace(input.To)
-	reason := strings.TrimSpace(input.Reason)
 	var result contracts.CustodyResponse
 	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
 		if _, exists := m.Case(id); !exists {
@@ -334,37 +331,24 @@ func (s *Service) TransferCustody(ctx context.Context, caseID string, input cont
 		transfer, err := domain.NewCustodyTransfer(
 			m.NextID("custody"),
 			id,
-			from,
-			to,
-			reason,
+			input.From,
+			input.To,
+			input.Reason,
 			s.now(),
 		)
 		if err != nil {
 			return err
 		}
-		return m.AppendCustody(transfer)
-	})
-	if err != nil {
-		return result, err
-	}
-	current, exists := s.custodian(ctx, id)
-	if !exists || current != from {
-		return result, fmt.Errorf("%w: %s is not the current custodian", domain.ErrStateConflict, from)
-	}
-	return s.Custody(ctx, id)
-}
-
-func (s *Service) custodian(ctx context.Context, caseID string) (string, bool) {
-	var holder string
-	found := false
-	err := s.repository.Read(ctx, func(snapshot repository.Snapshot) error {
-		holder, found = snapshot.CurrentCustodian(caseID)
+		if err := m.AppendCustody(transfer); err != nil {
+			return err
+		}
+		result = custodyViewFromMutation(m, id)
 		return nil
 	})
 	if err != nil {
-		return "", false
+		return contracts.CustodyResponse{}, err
 	}
-	return holder, found
+	return result, nil
 }
 
 func custodyView(snapshot repository.Snapshot, caseID string) contracts.CustodyResponse {
@@ -373,6 +357,15 @@ func custodyView(snapshot repository.Snapshot, caseID string) contracts.CustodyR
 		CaseID:    caseID,
 		Current:   holder,
 		Transfers: snapshot.Custody(caseID),
+	}
+}
+
+func custodyViewFromMutation(m *repository.Mutation, caseID string) contracts.CustodyResponse {
+	holder, _ := m.CurrentCustodian(caseID)
+	return contracts.CustodyResponse{
+		CaseID:    caseID,
+		Current:   holder,
+		Transfers: m.Custody(caseID),
 	}
 }
 

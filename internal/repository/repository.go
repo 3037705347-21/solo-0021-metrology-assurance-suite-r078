@@ -72,12 +72,7 @@ func (s Snapshot) Custody(caseID string) []domain.CustodyTransfer {
 }
 
 func (s Snapshot) CurrentCustodian(caseID string) (string, bool) {
-	for _, item := range s.custody[caseID] {
-		if item.To != "" {
-			return item.To, true
-		}
-	}
-	return "", false
+	return domain.CurrentCustodian(s.custody[caseID])
 }
 
 func (s Snapshot) Events(caseID string) []domain.AuditEvent {
@@ -210,12 +205,23 @@ func (m *Mutation) Custody(caseID string) []domain.CustodyTransfer {
 	return append([]domain.CustodyTransfer(nil), m.custody[caseID]...)
 }
 
+func (m *Mutation) CurrentCustodian(caseID string) (string, bool) {
+	return domain.CurrentCustodian(m.custody[caseID])
+}
+
 func (m *Mutation) AppendCustody(item domain.CustodyTransfer) error {
 	if _, exists := m.cases[item.CaseID]; !exists {
 		return fmt.Errorf("%w: case %s", domain.ErrNotFound, item.CaseID)
 	}
 	if _, exists := m.seals[item.CaseID]; !exists {
 		return fmt.Errorf("%w: case %s has no evidence seal", domain.ErrStateConflict, item.CaseID)
+	}
+	current, exists := m.CurrentCustodian(item.CaseID)
+	switch {
+	case !exists && !item.IsOrigin():
+		return fmt.Errorf("%w: case %s custody chain must start from the sealer", domain.ErrStateConflict, item.CaseID)
+	case exists && item.From != current:
+		return fmt.Errorf("%w: %s is not the current custodian", domain.ErrStateConflict, item.From)
 	}
 	m.custody[item.CaseID] = append(m.custody[item.CaseID], item)
 	return nil

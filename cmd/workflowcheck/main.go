@@ -40,6 +40,7 @@ func main() {
 		"record-measurement":       checkRecordMeasurement,
 		"reopen-verification-case": checkReopenVerificationCase,
 		"seal-verification":        checkSealVerification,
+		"custody-transfer":         checkCustodyTransfer,
 	}
 	run, ok := checks[*workflow]
 	if !ok {
@@ -375,6 +376,146 @@ func checkSealVerification() error {
 	return nil
 }
 
+func checkCustodyTransfer() error {
+	h := newHarness()
+	defer h.close()
+
+	caseID, err := h.readyCase("MET-1501")
+	if err != nil {
+		return err
+	}
+	sealed, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer": "Vera",
+		"summary":  "accepted measurement sealed for review",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(sealed, http.StatusCreated); err != nil {
+		return err
+	}
+
+	// The custody chain starts from the sealer, not the case steward.
+	ledger, err := h.custody(caseID)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(ledger, http.StatusOK); err != nil {
+		return err
+	}
+	if err := expectCustodyChain(ledger.Body, "Vera"); err != nil {
+		return fmt.Errorf("after seal: %w", err)
+	}
+
+	// A transfer that does not start from the current custodian is rejected
+	// and leaves no record in the ledger.
+	rejected, err := h.transfer(caseID, "Qiao", "Mira")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(rejected, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(rejected, "state_conflict"); err != nil {
+		return err
+	}
+	ledger, err = h.custody(caseID)
+	if err != nil {
+		return err
+	}
+	if err := expectCustodyChain(ledger.Body, "Vera"); err != nil {
+		return fmt.Errorf("after rejected transfer: %w", err)
+	}
+
+	// Each committed transfer advances the chain to its receiver.
+	first, err := h.transfer(caseID, "Vera", "Mira")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(first, http.StatusOK); err != nil {
+		return err
+	}
+	if err := expectCustodyChain(first.Body, "Vera", "Mira"); err != nil {
+		return fmt.Errorf("after first transfer: %w", err)
+	}
+	second, err := h.transfer(caseID, "Mira", "Qiao")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(second, http.StatusOK); err != nil {
+		return err
+	}
+	if err := expectCustodyChain(second.Body, "Vera", "Mira", "Qiao"); err != nil {
+		return fmt.Errorf("after second transfer: %w", err)
+	}
+
+	// A custodian that already handed off can no longer transfer.
+	stale, err := h.transfer(caseID, "Mira", "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(stale, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(stale, "state_conflict"); err != nil {
+		return err
+	}
+
+	// Two concurrent transfers from the same custodian: exactly one commits.
+	type outcome struct {
+		response apiResponse
+		err      error
+	}
+	results := make(chan outcome, 2)
+	var wait sync.WaitGroup
+	for _, receiver := range []string{"Rui", "Song"} {
+		wait.Add(1)
+		go func(receiver string) {
+			defer wait.Done()
+			response, err := h.transfer(caseID, "Qiao", receiver)
+			results <- outcome{response: response, err: err}
+		}(receiver)
+	}
+	wait.Wait()
+	close(results)
+
+	successes := 0
+	conflicts := 0
+	winner := ""
+	for item := range results {
+		if item.err != nil {
+			return item.err
+		}
+		switch item.response.Status {
+		case http.StatusOK:
+			successes++
+			current, err := nestedString(item.response.Body, "current_custodian")
+			if err != nil {
+				return err
+			}
+			winner = current
+		case http.StatusConflict:
+			conflicts++
+		default:
+			return fmt.Errorf("unexpected concurrent transfer status %d: %s", item.response.Status, item.response.Raw)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		return fmt.Errorf("concurrent transfer outcomes: %d success, %d conflict", successes, conflicts)
+	}
+
+	// The ledger stays a single chain of the committed transfers, and the
+	// records written earlier are unchanged.
+	ledger, err = h.custody(caseID)
+	if err != nil {
+		return err
+	}
+	if err := expectCustodyChain(ledger.Body, "Vera", "Mira", "Qiao", winner); err != nil {
+		return fmt.Errorf("after concurrent transfers: %w", err)
+	}
+	return nil
+}
+
 func newHarness() *harness {
 	server := httptest.NewServer(bootstrap.NewHandler())
 	return &harness{
@@ -463,6 +604,18 @@ func (h *harness) recordMeasurement(caseID string, observed float64, technician 
 	})
 }
 
+func (h *harness) custody(caseID string) (apiResponse, error) {
+	return h.request(http.MethodGet, "/cases/"+caseID+"/custody", nil)
+}
+
+func (h *harness) transfer(caseID, from, to string) (apiResponse, error) {
+	return h.request(http.MethodPost, "/cases/"+caseID+"/custody", map[string]any{
+		"from":   from,
+		"to":     to,
+		"reason": "custody handoff",
+	})
+}
+
 func (h *harness) rejectedCase(tag string) (string, error) {
 	deviceID, err := h.createDevice(tag)
 	if err != nil {
@@ -523,6 +676,43 @@ func expectErrorCode(response apiResponse, expected string) error {
 	}
 	if code != expected {
 		return fmt.Errorf("error code = %q, expected %q", code, expected)
+	}
+	return nil
+}
+
+// expectCustodyChain verifies that the ledger is one unbroken chain whose
+// records hand custody from the sealer through each receiver in order, and
+// that the current custodian is the last receiver.
+func expectCustodyChain(body map[string]any, receivers ...string) error {
+	current, err := nestedString(body, "current_custodian")
+	if err != nil {
+		return err
+	}
+	if current != receivers[len(receivers)-1] {
+		return fmt.Errorf("current custodian = %q, expected %q", current, receivers[len(receivers)-1])
+	}
+	transfers, err := nestedSlice(body, "transfers")
+	if err != nil {
+		return err
+	}
+	if len(transfers) != len(receivers) {
+		return fmt.Errorf("ledger has %d transfers, expected %d", len(transfers), len(receivers))
+	}
+	previous := ""
+	for index, receiver := range receivers {
+		entry, ok := transfers[index].(map[string]any)
+		if !ok {
+			return fmt.Errorf("transfer %d is not an object", index)
+		}
+		from, _ := entry["from"].(string)
+		if from != previous {
+			return fmt.Errorf("transfer %d from = %q, expected %q", index, from, previous)
+		}
+		to, _ := entry["to"].(string)
+		if to != receiver {
+			return fmt.Errorf("transfer %d to = %q, expected %q", index, to, receiver)
+		}
+		previous = receiver
 	}
 	return nil
 }

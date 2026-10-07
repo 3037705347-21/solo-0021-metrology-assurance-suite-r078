@@ -82,3 +82,13 @@ func (c CustodyTransfer) Validate() error {
 func (c CustodyTransfer) IsOrigin() bool {
 	return c.From == ""
 }
+
+// CurrentCustodian reports the receiver of the latest transfer in the chain.
+func CurrentCustodian(chain []CustodyTransfer) (string, bool) {
+	for index := len(chain) - 1; index >= 0; index-- {
+		if chain[index].To != "" {
+			return chain[index].To, true
+		}
+	}
+	return "", false
+}
