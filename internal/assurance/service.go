@@ -286,7 +286,7 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 			m.NextID("custody"),
 			item.ID,
 			"",
-			item.Steward,
+			seal.Reviewer,
 			"evidence sealed and entered custody",
 			s.now(),
 		)
@@ -342,39 +342,36 @@ func (s *Service) TransferCustody(ctx context.Context, caseID string, input cont
 		if err != nil {
 			return err
 		}
-		return m.AppendCustody(transfer)
+		if err := m.AppendCustody(transfer); err != nil {
+			return err
+		}
+		result = custodyView(m, id)
+		return nil
 	})
 	if err != nil {
 		return result, err
 	}
-	current, exists := s.custodian(ctx, id)
-	if !exists || current != from {
-		return result, fmt.Errorf("%w: %s is not the current custodian", domain.ErrStateConflict, from)
-	}
-	return s.Custody(ctx, id)
+	return result, nil
 }
 
-func (s *Service) custodian(ctx context.Context, caseID string) (string, bool) {
-	var holder string
-	found := false
-	err := s.repository.Read(ctx, func(snapshot repository.Snapshot) error {
-		holder, found = snapshot.CurrentCustodian(caseID)
-		return nil
-	})
-	if err != nil {
-		return "", false
-	}
-	return holder, found
-}
-
-func custodyView(snapshot repository.Snapshot, caseID string) contracts.CustodyResponse {
-	holder, _ := snapshot.CurrentCustodian(caseID)
+func custodyView(reader custodyReader, caseID string) contracts.CustodyResponse {
+	holder, _ := reader.CurrentCustodian(caseID)
 	return contracts.CustodyResponse{
 		CaseID:    caseID,
 		Current:   holder,
-		Transfers: snapshot.Custody(caseID),
+		Transfers: reader.Custody(caseID),
 	}
 }
+
+type custodyReader interface {
+	CurrentCustodian(caseID string) (string, bool)
+	Custody(caseID string) []domain.CustodyTransfer
+}
+
+var (
+	_ custodyReader = repository.Snapshot{}
+	_ custodyReader = (*repository.Mutation)(nil)
+)
 
 func bestAcceptedMeasurement(items []domain.Measurement) (domain.Measurement, bool) {
 	var selected domain.Measurement
